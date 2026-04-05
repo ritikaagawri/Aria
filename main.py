@@ -22,10 +22,10 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-IST             = ZoneInfo("Asia/Kolkata")
-SENT_IDS_FILE   = "sent_ids.json"
+IST           = ZoneInfo("Asia/Kolkata")
+SENT_IDS_FILE = "sent_ids.json"
 
-bot    = telebot.TeleBot(TELEGRAM_TOKEN)
+bot    = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # ─────────────────────────────────────────────
@@ -170,7 +170,7 @@ RSS_FEEDS = {
     "GLOBAL": [
         "https://feeds.reuters.com/reuters/topNews",
         "https://feeds.reuters.com/reuters/worldNews",
-        "https://rss.app/feeds/tJCgBkbR9mMxVa7K.xml",  # Bloomberg World
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
     ],
     "INDIA": [
         "https://economictimes.indiatimes.com/news/economy/rssfeeds/1415012842.cms",
@@ -185,33 +185,29 @@ RSS_FEEDS = {
     ],
     "RETAIL_APPAREL": [
         "https://economictimes.indiatimes.com/industry/cons-products/fashion-/-cosmetics-/-jewellery/rssfeeds/13357270.cms",
-        "https://www.business-standard.com/rss/companies-10101.rss",
         "https://www.fibre2fashion.com/rss/news.xml",
     ],
     "LABOUR_COMPLIANCE": [
         "https://economictimes.indiatimes.com/news/economy/policy/rssfeeds/1052732854.cms",
         "https://www.business-standard.com/rss/economy-policy-10206.rss",
-        "https://labour.gov.in/rss.xml",
     ],
     "HR_WORKFORCE": [
         "https://economictimes.indiatimes.com/jobs/rssfeeds/107115.cms",
-        "https://www.business-standard.com/rss/companies-10101.rss",
     ],
     "HR_TECH": [
         "https://hr.economictimes.indiatimes.com/rss/topstories",
-        "https://www.business-standard.com/rss/technology-108.rss",
     ],
 }
 
 def fetch_rss(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; ARIA-Bot/1.0)"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=12)
         if not resp.ok:
-            log.warning(f"RSS fetch failed [{url}]: {resp.status_code}")
+            log.warning(f"RSS failed [{url}]: {resp.status_code}")
             return []
 
-        root = ET.fromstring(resp.content)
+        root     = ET.fromstring(resp.content)
         articles = []
 
         for item in root.iter("item"):
@@ -223,26 +219,24 @@ def fetch_rss(url):
             if not title or not link:
                 continue
 
-            # Parse publish date
             pub_dt = None
-            if pub:
-                for fmt in [
-                    "%a, %d %b %Y %H:%M:%S %z",
-                    "%a, %d %b %Y %H:%M:%S GMT",
-                    "%Y-%m-%dT%H:%M:%S%z",
-                ]:
-                    try:
-                        pub_dt = datetime.strptime(pub, fmt)
-                        break
-                    except Exception:
-                        continue
+            for fmt in [
+                "%a, %d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S GMT",
+                "%Y-%m-%dT%H:%M:%S%z",
+            ]:
+                try:
+                    pub_dt = datetime.strptime(pub, fmt)
+                    break
+                except Exception:
+                    continue
 
             articles.append({
-                "title": title,
-                "url": link,
-                "description": desc[:200] if desc else "",
+                "title":       title,
+                "url":         link,
+                "description": desc[:300] if desc else "",
                 "publishedAt": pub_dt.isoformat() if pub_dt else "",
-                "pub_dt": pub_dt,
+                "pub_dt":      pub_dt,
             })
 
         return articles
@@ -265,11 +259,9 @@ def fetch_all_rss():
                 uid   = a["url"]
                 title = a["title"]
 
-                # Skip if already sent
                 if uid in sent_ids or title in seen_titles:
                     continue
 
-                # Skip if older than 24 hours
                 if a["pub_dt"]:
                     pub_naive = a["pub_dt"].replace(tzinfo=None)
                     if pub_naive < cutoff:
@@ -282,7 +274,7 @@ def fetch_all_rss():
             time.sleep(0.3)
 
         all_articles[section] = articles
-        log.info(f"{section}: {len(articles)} fresh articles")
+        log.info(f"{section}: {len(articles)} fresh articles fetched")
 
     save_json(SENT_IDS_FILE, list(sent_ids)[-1000:])
     return all_articles
@@ -293,12 +285,13 @@ def fetch_all_rss():
 
 CLASSIFY_PROMPT = """You are a news classifier for Ritika Gawri, Head of HR at Numero Uno Clothing Limited (NUCL), an Indian apparel manufacturer and retailer with factories in Haryana and Uttarakhand and retail stores pan-India.
 
-You will receive real news articles fetched live from RSS feeds right now. Each article includes its publish time.
+You will receive real news articles fetched live from RSS feeds right now.
 
 For each article classify as URGENT, IMPORTANT, or DISCARD.
 For URGENT and IMPORTANT write one bullet — max 15 words, fact-first, no source name, no asterisks, no markdown.
 
-After all sections add NUCL_IMPACT: pick 3-5 items that directly affect NUCL — costs, compliance, workforce, or retail. Format: [what happened] — [specific implication for NUCL in one line]
+After all sections add NUCL_IMPACT: pick 3-5 items that directly affect NUCL costs, compliance, workforce, or retail. Format each as:
+[what happened] — [specific implication for NUCL in one line]
 
 Output ONLY valid JSON, no markdown, no code blocks:
 {
@@ -332,7 +325,7 @@ def classify_articles(all_articles):
     input_data = {
         section: [
             {
-                "title": a["title"],
+                "title":       a["title"],
                 "description": a["description"],
                 "publishedAt": a["publishedAt"],
             }
@@ -345,15 +338,15 @@ def classify_articles(all_articles):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "x-api-key":          ANTHROPIC_KEY,
+                "anthropic-version":  "2023-06-01",
+                "content-type":       "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model":      "claude-sonnet-4-20250514",
                 "max_tokens": 4000,
-                "system": CLASSIFY_PROMPT,
-                "messages": [{"role": "user", "content": json.dumps(input_data)}]
+                "system":     CLASSIFY_PROMPT,
+                "messages":   [{"role": "user", "content": json.dumps(input_data)}]
             },
             timeout=45
         )
@@ -375,7 +368,7 @@ def build_and_send_brief(chat_id, triggered=False):
     log.info(f"Running {'on-demand' if triggered else 'scheduled'} news brief...")
 
     all_articles = fetch_all_rss()
-    total = sum(len(v) for v in all_articles.values())
+    total        = sum(len(v) for v in all_articles.values())
     log.info(f"Total fresh articles: {total}")
 
     if total == 0:
@@ -418,7 +411,7 @@ def build_and_send_brief(chat_id, triggered=False):
         lines.append("Nothing significant to report right now.")
 
     send_message("\n".join(lines), chat_id)
-    log.info("Brief sent.")
+    log.info("Brief sent successfully.")
 
 def morning_brief_job():
     build_and_send_brief(chat_id=TELEGRAM_CHAT_ID, triggered=False)
@@ -450,7 +443,7 @@ If NOTHING qualifies output exactly: NONE"""
 def check_urgent_alerts():
     log.info("Checking urgent alerts...")
     all_articles = fetch_all_rss()
-    flat = [a for arts in all_articles.values() for a in arts]
+    flat         = [a for arts in all_articles.values() for a in arts]
     if not flat:
         return
 
@@ -463,15 +456,15 @@ def check_urgent_alerts():
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": ANTHROPIC_KEY,
+                "x-api-key":         ANTHROPIC_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "content-type":      "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model":      "claude-sonnet-4-20250514",
                 "max_tokens": 800,
-                "system": URGENT_PROMPT,
-                "messages": [{"role": "user", "content": input_text}]
+                "system":     URGENT_PROMPT,
+                "messages":   [{"role": "user", "content": input_text}]
             },
             timeout=20
         )
@@ -491,11 +484,12 @@ def check_urgent_alerts():
         log.error(f"Urgent alert error: {e}")
 
 # ─────────────────────────────────────────────
-# BOT COMMAND HANDLERS
+# BOT HANDLERS
 # ─────────────────────────────────────────────
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=["start"])
 def cmd_start(message):
+    log.info(f"Received /start from {message.chat.id}")
     send_message(
         "Hi Ritika! ARIA is online.\n\n"
         "<b>Commands:</b>\n"
@@ -506,8 +500,9 @@ def cmd_start(message):
         message.chat.id
     )
 
-@bot.message_handler(commands=['help'])
+@bot.message_handler(commands=["help"])
 def cmd_help(message):
+    log.info(f"Received /help from {message.chat.id}")
     send_message(
         "<b>ARIA — Your Personal AI Assistant</b>\n\n"
         "/news — Live news brief with NUCL impact\n"
@@ -521,13 +516,15 @@ def cmd_help(message):
         message.chat.id
     )
 
-@bot.message_handler(commands=['clear'])
+@bot.message_handler(commands=["clear"])
 def cmd_clear(message):
+    log.info(f"Received /clear from {message.chat.id}")
     conversation_history[message.chat.id] = []
     send_message("Conversation cleared. Fresh start!", message.chat.id)
 
-@bot.message_handler(commands=['news'])
+@bot.message_handler(commands=["news"])
 def cmd_news(message):
+    log.info(f"Received /news from {message.chat.id}")
     send_message("Fetching live news from RSS feeds... give me a moment.", message.chat.id)
     threading.Thread(
         target=build_and_send_brief,
@@ -535,8 +532,9 @@ def cmd_news(message):
         daemon=True
     ).start()
 
-@bot.message_handler(func=lambda message: message.text is not None and not message.text.startswith('/'))
+@bot.message_handler(func=lambda m: m.text is not None and not m.text.startswith("/"))
 def handle_message(message):
+    log.info(f"Received message from {message.chat.id}: {message.text[:50]}")
     chat_id   = message.chat.id
     user_text = message.text
 
@@ -575,5 +573,5 @@ if __name__ == "__main__":
                       hour=15, minute=55, day_of_week="mon-fri")
 
     scheduler.start()
-    log.info("ARIA is online.")
-    bot.infinity_polling()
+    log.info("ARIA is online. Morning brief 7 AM IST. Urgent checks 9 AM-4 PM IST.")
+    bot.infinity_polling(allowed_updates=["message"])
