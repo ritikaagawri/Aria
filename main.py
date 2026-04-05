@@ -181,7 +181,6 @@ RSS_FEEDS = {
     "MARKETS": [
         "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
         "https://www.moneycontrol.com/rss/MCtopnews.xml",
-        "https://www.business-standard.com/rss/markets-106.rss",
     ],
     "RETAIL_APPAREL": [
         "https://economictimes.indiatimes.com/industry/cons-products/fashion-/-cosmetics-/-jewellery/rssfeeds/13357270.cms",
@@ -234,7 +233,7 @@ def fetch_rss(url):
             articles.append({
                 "title":       title,
                 "url":         link,
-                "description": desc[:300] if desc else "",
+                "description": desc[:150] if desc else "",
                 "publishedAt": pub_dt.isoformat() if pub_dt else "",
                 "pub_dt":      pub_dt,
             })
@@ -285,7 +284,7 @@ def fetch_all_rss():
 
 CLASSIFY_PROMPT = """You are a news classifier for Ritika Gawri, Head of HR at Numero Uno Clothing Limited (NUCL), an Indian apparel manufacturer and retailer with factories in Haryana and Uttarakhand and retail stores pan-India.
 
-You will receive real news articles fetched live from RSS feeds.
+You will receive real news articles fetched live from RSS feeds right now.
 
 For each article classify as URGENT, IMPORTANT, or DISCARD.
 For URGENT and IMPORTANT write one bullet — max 15 words, fact-first, no source name, no asterisks, no markdown.
@@ -326,10 +325,10 @@ def classify_articles(all_articles):
         section: [
             {
                 "title":       a["title"],
-                "description": a["description"],
+                "description": a["description"][:150],
                 "publishedAt": a["publishedAt"],
             }
-            for a in articles
+            for a in articles[:15]
         ]
         for section, articles in all_articles.items()
     }
@@ -348,7 +347,7 @@ def classify_articles(all_articles):
                 "system":     CLASSIFY_PROMPT,
                 "messages":   [{"role": "user", "content": json.dumps(input_data)}]
             },
-            timeout=45
+            timeout=240
         )
         if resp.ok:
             text = resp.json()["content"][0]["text"].strip()
@@ -466,7 +465,7 @@ def check_urgent_alerts():
                 "system":     URGENT_PROMPT,
                 "messages":   [{"role": "user", "content": input_text}]
             },
-            timeout=20
+            timeout=60
         )
         if resp.ok:
             result = resp.json()["content"][0]["text"].strip()
@@ -484,7 +483,7 @@ def check_urgent_alerts():
         log.error(f"Urgent alert error: {e}")
 
 # ─────────────────────────────────────────────
-# SINGLE MESSAGE HANDLER — handles ALL messages
+# SINGLE MESSAGE HANDLER
 # ─────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text is not None)
@@ -494,7 +493,6 @@ def handle_all(message):
 
     log.info(f"Received from {chat_id}: {text[:60]}")
 
-    # /news
     if text.startswith("/news"):
         send_message("Fetching live news from RSS feeds... give me a moment.", chat_id)
         threading.Thread(
@@ -504,13 +502,11 @@ def handle_all(message):
         ).start()
         return
 
-    # /clear
     if text.startswith("/clear"):
         conversation_history[chat_id] = []
         send_message("Conversation cleared. Fresh start!", chat_id)
         return
 
-    # /start
     if text.startswith("/start"):
         send_message(
             "Hi Ritika! ARIA is online.\n\n"
@@ -523,7 +519,6 @@ def handle_all(message):
         )
         return
 
-    # /help
     if text.startswith("/help"):
         send_message(
             "<b>ARIA — Your Personal AI Assistant</b>\n\n"
@@ -539,11 +534,10 @@ def handle_all(message):
         )
         return
 
-    # ignore other commands
     if text.startswith("/"):
         return
 
-    # regular message — send to Claude
+    # Regular message — send to Claude
     add_to_history(chat_id, "user", text)
 
     try:
