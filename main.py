@@ -4,6 +4,7 @@ import time
 import logging
 import requests
 import threading
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import anthropic
@@ -19,11 +20,9 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY")
-NEWS_API_KEY     = os.environ.get("NEWS_API_KEY")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 IST             = ZoneInfo("Asia/Kolkata")
-HOLD_QUEUE_FILE = "hold_queue.json"
 SENT_IDS_FILE   = "sent_ids.json"
 
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -41,7 +40,6 @@ def load_nucl_data():
                 if data:
                     log.info(f"NUCL data loaded from {fname}")
                     return data
-    log.info("No NUCL data file found.")
     return ""
 
 NUCL_DATA = load_nucl_data()
@@ -67,7 +65,7 @@ YOUR DUTIES:
    - Employee relations, PIP, disciplinary matters
 
 2. NEWS & INTELLIGENCE
-   - Real-time news briefs fetched from live sources
+   - Real-time news briefs fetched from live RSS feeds
    - Morning brief auto-sent at 7 AM IST daily
    - Use /news for on-demand brief
    - Every brief ends with NUCL IMPACT section
@@ -165,48 +163,154 @@ def save_json(filepath, data):
         log.error(f"Save JSON error: {e}")
 
 # ─────────────────────────────────────────────
-# NEWS — FETCH FROM NEWSAPI
+# RSS FEEDS
 # ─────────────────────────────────────────────
 
-SEARCH_QUERIES = {
+RSS_FEEDS = {
     "GLOBAL": [
-        "geopolitics war sanctions",
-        "US economy Federal Reserve",
-        "China economy trade",
-        "oil price crude",
-        "Europe economy politics",
+        "https://feeds.reuters.com/reuters/topNews",
+        "https://feeds.reuters.com/reuters/worldNews",
+        "https://rss.app/feeds/tJCgBkbR9mMxVa7K.xml",  # Bloomberg World
     ],
     "INDIA": [
-        "India economy RBI rupee",
-        "India government policy regulation",
-        "India trade export import",
-        "India inflation budget fiscal",
-        "India infrastructure investment",
+        "https://economictimes.indiatimes.com/news/economy/rssfeeds/1415012842.cms",
+        "https://www.business-standard.com/rss/economy-policy-10206.rss",
+        "https://www.livemint.com/rss/economy",
+        "https://feeds.feedburner.com/ndtvprofit-latest",
     ],
     "MARKETS": [
-        "Nifty Sensex stock market India",
-        "FII DII India market flows",
-        "India market global cues",
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+        "https://www.moneycontrol.com/rss/MCtopnews.xml",
+        "https://www.business-standard.com/rss/markets-106.rss",
     ],
     "RETAIL_APPAREL": [
-        "India fashion retail apparel textile",
-        "India GST garments textile",
-        "India retail ecommerce consumer",
+        "https://economictimes.indiatimes.com/industry/cons-products/fashion-/-cosmetics-/-jewellery/rssfeeds/13357270.cms",
+        "https://www.business-standard.com/rss/companies-10101.rss",
+        "https://www.fibre2fashion.com/rss/news.xml",
     ],
     "LABOUR_COMPLIANCE": [
-        "India labour code EPFO ESIC",
-        "India minimum wage employment law",
-        "India gratuity labour court ruling",
+        "https://economictimes.indiatimes.com/news/economy/policy/rssfeeds/1052732854.cms",
+        "https://www.business-standard.com/rss/economy-policy-10206.rss",
+        "https://labour.gov.in/rss.xml",
     ],
     "HR_WORKFORCE": [
-        "India hiring layoffs workforce",
-        "India gig economy employment data",
+        "https://economictimes.indiatimes.com/jobs/rssfeeds/107115.cms",
+        "https://www.business-standard.com/rss/companies-10101.rss",
     ],
     "HR_TECH": [
-        "HR technology HRMS payroll India",
-        "Darwinbox greytHR Keka HR tech",
+        "https://hr.economictimes.indiatimes.com/rss/topstories",
+        "https://www.business-standard.com/rss/technology-108.rss",
     ],
 }
+
+def fetch_rss(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ARIA-Bot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if not resp.ok:
+            log.warning(f"RSS fetch failed [{url}]: {resp.status_code}")
+            return []
+
+        root = ET.fromstring(resp.content)
+        articles = []
+
+        for item in root.iter("item"):
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            desc  = item.findtext("description", "").strip()
+            pub   = item.findtext("pubDate", "").strip()
+
+            if not title or not link:
+                continue
+
+            # Parse publish date
+            pub_dt = None
+            if pub:
+                for fmt in [
+                    "%a, %d %b %Y %H:%M:%S %z",
+                    "%a, %d %b %Y %H:%M:%S GMT",
+                    "%Y-%m-%dT%H:%M:%S%z",
+                ]:
+                    try:
+                        pub_dt = datetime.strptime(pub, fmt)
+                        break
+                    except Exception:
+                        continue
+
+            articles.append({
+                "title": title,
+                "url": link,
+                "description": desc[:200] if desc else "",
+                "publishedAt": pub_dt.isoformat() if pub_dt else "",
+                "pub_dt": pub_dt,
+            })
+
+        return articles
+
+    except Exception as e:
+        log.error(f"RSS parse error [{url}]: {e}")
+        return []
+
+def fetch_all_rss():
+    sent_ids     = set(load_json(SENT_IDS_FILE, []))
+    all_articles = {}
+    cutoff       = datetime.now(IST).replace(tzinfo=None) - timedelta(hours=24)
+
+    for section, urls in RSS_FEEDS.items():
+        articles    = []
+        seen_titles = set()
+
+        for url in urls:
+            for a in fetch_rss(url):
+                uid   = a["url"]
+                title = a["title"]
+
+                # Skip if already sent
+                if uid in sent_ids or title in seen_titles:
+                    continue
+
+                # Skip if older than 24 hours
+                if a["pub_dt"]:
+                    pub_naive = a["pub_dt"].replace(tzinfo=None)
+                    if pub_naive < cutoff:
+                        continue
+
+                articles.append(a)
+                sent_ids.add(uid)
+                seen_titles.add(title)
+
+            time.sleep(0.3)
+
+        all_articles[section] = articles
+        log.info(f"{section}: {len(articles)} fresh articles")
+
+    save_json(SENT_IDS_FILE, list(sent_ids)[-1000:])
+    return all_articles
+
+# ─────────────────────────────────────────────
+# CLASSIFY VIA CLAUDE
+# ─────────────────────────────────────────────
+
+CLASSIFY_PROMPT = """You are a news classifier for Ritika Gawri, Head of HR at Numero Uno Clothing Limited (NUCL), an Indian apparel manufacturer and retailer with factories in Haryana and Uttarakhand and retail stores pan-India.
+
+You will receive real news articles fetched live from RSS feeds right now. Each article includes its publish time.
+
+For each article classify as URGENT, IMPORTANT, or DISCARD.
+For URGENT and IMPORTANT write one bullet — max 15 words, fact-first, no source name, no asterisks, no markdown.
+
+After all sections add NUCL_IMPACT: pick 3-5 items that directly affect NUCL — costs, compliance, workforce, or retail. Format: [what happened] — [specific implication for NUCL in one line]
+
+Output ONLY valid JSON, no markdown, no code blocks:
+{
+  "GLOBAL": [{"headline": "...", "class": "URGENT|IMPORTANT|DISCARD"}],
+  "INDIA": [...],
+  "MARKETS": [...],
+  "RETAIL_APPAREL": [...],
+  "LABOUR_COMPLIANCE": [...],
+  "HR_WORKFORCE": [...],
+  "HR_TECH": [...],
+  "NUCL_IMPACT": [{"headline": "..."}]
+}"""
 
 SECTION_LABELS = {
     "GLOBAL":            "🌍 GLOBAL",
@@ -224,84 +328,13 @@ SECTION_CAPS = {
     "LABOUR_COMPLIANCE": 5, "HR_WORKFORCE": 3, "HR_TECH": 3,
 }
 
-def fetch_articles():
-    sent_ids = set(load_json(SENT_IDS_FILE, []))
-    all_articles = {}
-    from_time = (datetime.now(IST) - timedelta(hours=22)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    for section, queries in SEARCH_QUERIES.items():
-        articles = []
-        seen_titles = set()
-        for q in queries:
-            try:
-                resp = requests.get(
-                    "https://newsapi.org/v2/everything",
-                    params={
-                        "q": q,
-                        "language": "en",
-                        "sortBy": "publishedAt",
-                        "pageSize": 15,
-                        "apiKey": NEWS_API_KEY,
-                        "from": from_time,
-                    },
-                    timeout=12
-                )
-                if resp.ok:
-                    for a in resp.json().get("articles", []):
-                        uid   = a.get("url", "")
-                        title = a.get("title", "")
-                        if uid and uid not in sent_ids and title not in seen_titles:
-                            articles.append(a)
-                            sent_ids.add(uid)
-                            seen_titles.add(title)
-                else:
-                    log.error(f"NewsAPI [{q}]: {resp.status_code} {resp.text[:200]}")
-            except Exception as e:
-                log.error(f"Fetch error [{q}]: {e}")
-            time.sleep(0.4)
-
-        all_articles[section] = articles
-        log.info(f"{section}: {len(articles)} articles fetched")
-
-    save_json(SENT_IDS_FILE, list(sent_ids)[-500:])
-    return all_articles
-
-# ─────────────────────────────────────────────
-# NEWS — CLASSIFY & SUMMARISE VIA CLAUDE
-# ─────────────────────────────────────────────
-
-CLASSIFY_PROMPT = """You are a news classifier and summariser for Ritika Gawri, Head of HR at Numero Uno Clothing Limited (NUCL), an Indian apparel manufacturer and retailer.
-
-You will receive real news articles grouped by section fetched from NewsAPI right now.
-
-For each article:
-- Classify as URGENT, IMPORTANT, or DISCARD
-- For URGENT and IMPORTANT: write one bullet, max 15 words, fact-first, no source name, no markdown, no asterisks
-
-NUCL context for relevance: apparel manufacturing, retail stores pan-India, factories in Haryana and Uttarakhand, workforce of varying size, subject to Indian labour laws.
-
-After all sections, add a NUCL_IMPACT section: pick 3-5 items from above that directly affect NUCL — costs, compliance, workforce, or retail. Format each as:
-[what happened] — [specific implication for NUCL]
-
-Output ONLY valid JSON, no markdown, no code blocks:
-{
-  "GLOBAL": [{"headline": "...", "class": "URGENT|IMPORTANT|DISCARD"}],
-  "INDIA": [...],
-  "MARKETS": [...],
-  "RETAIL_APPAREL": [...],
-  "LABOUR_COMPLIANCE": [...],
-  "HR_WORKFORCE": [...],
-  "HR_TECH": [...],
-  "NUCL_IMPACT": [{"headline": "..."}]
-}"""
-
 def classify_articles(all_articles):
     input_data = {
         section: [
             {
-                "title": a.get("title", ""),
-                "description": a.get("description", ""),
-                "publishedAt": a.get("publishedAt", "")
+                "title": a["title"],
+                "description": a["description"],
+                "publishedAt": a["publishedAt"],
             }
             for a in articles
         ]
@@ -335,18 +368,18 @@ def classify_articles(all_articles):
     return {}
 
 # ─────────────────────────────────────────────
-# NEWS — BUILD AND SEND BRIEF
+# BUILD AND SEND BRIEF
 # ─────────────────────────────────────────────
 
 def build_and_send_brief(chat_id, triggered=False):
     log.info(f"Running {'on-demand' if triggered else 'scheduled'} news brief...")
 
-    all_articles = fetch_articles()
+    all_articles = fetch_all_rss()
     total = sum(len(v) for v in all_articles.values())
-    log.info(f"Total articles fetched: {total}")
+    log.info(f"Total fresh articles: {total}")
 
     if total == 0:
-        send_message("No new articles found right now. Try again shortly.", chat_id)
+        send_message("No fresh news found right now. Try again shortly.", chat_id)
         return
 
     classified = classify_articles(all_articles)
@@ -354,9 +387,9 @@ def build_and_send_brief(chat_id, triggered=False):
         send_message("News fetched but classification failed. Try again shortly.", chat_id)
         return
 
-    now_str = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
-    label   = "On-Demand Brief" if triggered else "Morning Brief"
-    lines   = [f"<b>📰 {label} — {now_str} IST</b>\n"]
+    now_str     = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
+    label       = "On-Demand Brief" if triggered else "Morning Brief"
+    lines       = [f"<b>📰 {label} — {now_str} IST</b>\n"]
     has_content = False
 
     for section, sec_label in SECTION_LABELS.items():
@@ -373,19 +406,19 @@ def build_and_send_brief(chat_id, triggered=False):
             for b in bullets[:cap]:
                 lines.append(f"• {b}")
 
-    # NUCL Impact section
     nucl_items = classified.get("NUCL_IMPACT", [])
     if nucl_items:
         has_content = True
         lines.append("\n<b>🎯 NUCL IMPACT</b>")
         for item in nucl_items:
-            lines.append(f"• {item.get('headline', '')}")
+            if item.get("headline"):
+                lines.append(f"• {item['headline']}")
 
     if not has_content:
         lines.append("Nothing significant to report right now.")
 
     send_message("\n".join(lines), chat_id)
-    log.info("Brief sent successfully.")
+    log.info("Brief sent.")
 
 def morning_brief_job():
     build_and_send_brief(chat_id=TELEGRAM_CHAT_ID, triggered=False)
@@ -394,7 +427,7 @@ def morning_brief_job():
 # URGENT ALERTS
 # ─────────────────────────────────────────────
 
-URGENT_CLASSIFY_PROMPT = """You are an urgent news detector for Ritika Gawri at Numero Uno Clothing Limited (NUCL), an Indian apparel company.
+URGENT_PROMPT = """You are an urgent news detector for Ritika Gawri at Numero Uno Clothing Limited (NUCL), an Indian apparel company.
 
 Review these real news articles and identify ONLY stories crossing hard thresholds:
 - Nifty or Sensex move greater than 1.5% intraday
@@ -407,7 +440,7 @@ Review these real news articles and identify ONLY stories crossing hard threshol
 - Major country default or financial crisis
 - India textile, garment, or GST sudden change
 
-For each qualifying story output:
+For each qualifying story:
 Category: [one word]
 Line1: [what happened, max 15 words]
 Line2: [why it matters for NUCL or India HR/markets, max 15 words]
@@ -416,14 +449,14 @@ If NOTHING qualifies output exactly: NONE"""
 
 def check_urgent_alerts():
     log.info("Checking urgent alerts...")
-    all_articles = fetch_articles()
+    all_articles = fetch_all_rss()
     flat = [a for arts in all_articles.values() for a in arts]
     if not flat:
         return
 
     input_text = "\n".join([
-        f"- {a.get('title', '')} | {a.get('description', '')} | {a.get('publishedAt', '')}"
-        for a in flat[:50]
+        f"- {a['title']} | {a['description']} | {a['publishedAt']}"
+        for a in flat[:60]
     ])
 
     try:
@@ -437,7 +470,7 @@ def check_urgent_alerts():
             json={
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 800,
-                "system": URGENT_CLASSIFY_PROMPT,
+                "system": URGENT_PROMPT,
                 "messages": [{"role": "user", "content": input_text}]
             },
             timeout=20
@@ -495,7 +528,7 @@ def cmd_clear(message):
 
 @bot.message_handler(commands=['news'])
 def cmd_news(message):
-    send_message("Fetching live news... give me a moment.", message.chat.id)
+    send_message("Fetching live news from RSS feeds... give me a moment.", message.chat.id)
     threading.Thread(
         target=build_and_send_brief,
         kwargs={"chat_id": message.chat.id, "triggered": True},
@@ -531,10 +564,8 @@ def handle_message(message):
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone=IST)
 
-    # Morning brief — 7 AM IST daily
     scheduler.add_job(morning_brief_job, "cron", hour=7, minute=0)
 
-    # Urgent alerts — market hours Mon-Fri
     scheduler.add_job(check_urgent_alerts, "cron",
                       hour="9,10,11,12,13,14,15", minute=30,
                       day_of_week="mon-fri")
