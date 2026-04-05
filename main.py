@@ -1,4 +1,4 @@
-import os  # v2
+import os
 import json
 import time
 import logging
@@ -10,122 +10,200 @@ import anthropic
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# ─────────────────────────────────────────────
+# SETUP
+# ─────────────────────────────────────────────
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
-ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_API_KEY")
-NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY")
+NEWS_API_KEY     = os.environ.get("NEWS_API_KEY")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-IST = ZoneInfo("Asia/Kolkata")
+IST             = ZoneInfo("Asia/Kolkata")
 HOLD_QUEUE_FILE = "hold_queue.json"
 SENT_IDS_FILE   = "sent_ids.json"
 
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-SYSTEM_PROMPT = """You are ARIA — Advanced Regulatory Intelligence Advisor — a smart HR assistant for Numero Uno Clothing Limited (NUCL), an apparel manufacturer and retailer based in Gurgaon with ~727 employees.
+# ─────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────
 
-You help Ritika, Head of HR, with:
-- HR compliance under all 4 Indian Labour Codes
-- Performance management, KPIs, appraisals, increment calculations
-- Drafting HR communications, JDs, policies
-- Payroll and greytHR related queries
-- Employee data analysis
+SYSTEM_PROMPT = """You are ARIA — Ritika's personal AI assistant, available on Telegram 24/7.
 
-Always be direct, practical, and concise. No corporate fluff. Use plain language.
-If you don't know something, say so clearly rather than guessing.
-Always flag legal compliance risks explicitly."""
+WHO YOU SERVE:
+Ritika Gawri — Head of HR at Numero Uno Clothing Limited (NUCL), an apparel manufacturer and retailer headquartered in Gurgaon with factories in Manesar and Selaqui, and retail stores pan-India.
+
+YOUR DUTIES:
+
+1. HR & COMPLIANCE (Professional)
+   - Indian Labour Code compliance (all 4 codes)
+   - Performance management, appraisals, KPIs, increment calculations
+   - Drafting HR communications, job descriptions, policies
+   - Payroll queries, greytHR and Megasoft support
+   - Employee relations, PIP, disciplinary matters
+
+2. NEWS & INTELLIGENCE
+   - You deliver morning news briefs at 7 AM IST daily via /news command
+   - Covering: geopolitics, Indian economy, markets, labour law, retail & apparel, HR tech
+   - Urgent alerts during market hours for breaking developments
+   - Always frame news in context of what it means for Ritika, NUCL, or Indian markets
+
+3. PERSONAL ASSISTANCE
+   - Retirement and financial planning
+   - Investment research and portfolio questions
+   - Any research, drafting, analysis Ritika needs
+
+YOUR STYLE:
+- Direct, practical, no corporate fluff
+- Plain language, not formal HR-speak
+- Flag compliance risks clearly
+- If unsure, say so — never guess on legal matters
+- Keep responses concise unless detail is needed
+
+You are NOT a generic chatbot. You are Ritika's dedicated assistant who knows her context."""
+
+# ─────────────────────────────────────────────
+# CONVERSATION MEMORY
+# ─────────────────────────────────────────────
 
 conversation_history = {}
 
-# ── TELEGRAM BOT HANDLERS ──────────────────────────────────────
+def get_history(chat_id):
+    if chat_id not in conversation_history:
+        conversation_history[chat_id] = []
+    return conversation_history[chat_id]
+
+def add_to_history(chat_id, role, content):
+    get_history(chat_id).append({"role": role, "content": content})
+    if len(conversation_history[chat_id]) > 20:
+        conversation_history[chat_id] = conversation_history[chat_id][-20:]
+
+# ─────────────────────────────────────────────
+# TELEGRAM HELPERS
+# ─────────────────────────────────────────────
+
+def send_message(text, chat_id):
+    if not text or not text.strip():
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+        try:
+            requests.post(url, json={
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "HTML"
+            }, timeout=10)
+        except Exception as e:
+            log.error(f"Telegram send error: {e}")
+        time.sleep(0.3)
+
+def send_broadcast(text):
+    send_message(text, TELEGRAM_CHAT_ID)
+
+# ─────────────────────────────────────────────
+# BOT COMMANDS
+# ─────────────────────────────────────────────
 
 @bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "Hi Ritika! ARIA is online. How can I help you today?")
+def cmd_start(message):
+    send_message(
+        "Hi Ritika! ARIA is online.\n\n"
+        "Commands:\n"
+        "/news — fetch today's news brief\n"
+        "/clear — clear conversation history\n"
+        "/help — show this menu\n\n"
+        "Or just type anything — I'm here.",
+        message.chat.id
+    )
+
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    send_message(
+        "ARIA — Your Personal AI Assistant\n\n"
+        "/news — On-demand news brief\n"
+        "/clear — Fresh conversation start\n\n"
+        "I handle:\n"
+        "• HR & labour compliance (NUCL)\n"
+        "• Morning news briefs at 7 AM IST\n"
+        "• Financial & retirement planning\n"
+        "• Any research or drafting you need",
+        message.chat.id
+    )
 
 @bot.message_handler(commands=['clear'])
-def clear(message):
+def cmd_clear(message):
     conversation_history[message.chat.id] = []
-    bot.reply_to(message, "Conversation cleared. Fresh start!")
+    send_message("Conversation cleared. Fresh start!", message.chat.id)
 
 @bot.message_handler(commands=['news'])
-def news_now(message):
-    bot.reply_to(message, "Fetching news... give me a moment.")
-    threading.Thread(target=lambda: morning_brief_job(triggered=True, chat_id=message.chat.id)).start()
+def cmd_news(message):
+    send_message("Fetching your news brief... give me a moment.", message.chat.id)
+    threading.Thread(
+        target=morning_brief_job,
+        kwargs={"triggered": True, "chat_id": message.chat.id}
+    ).start()
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    chat_id  = message.chat.id
+    chat_id   = message.chat.id
     user_text = message.text
 
-    if chat_id not in conversation_history:
-        conversation_history[chat_id] = []
-
-    conversation_history[chat_id].append({"role": "user", "content": user_text})
-
-    if len(conversation_history[chat_id]) > 10:
-        conversation_history[chat_id] = conversation_history[chat_id][-10:]
+    add_to_history(chat_id, "user", user_text)
 
     try:
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+            max_tokens=1500,
             system=SYSTEM_PROMPT,
-            messages=conversation_history[chat_id]
+            messages=get_history(chat_id)
         )
         reply = response.content[0].text
-        conversation_history[chat_id].append({"role": "assistant", "content": reply})
-        bot.reply_to(message, reply)
+        add_to_history(chat_id, "assistant", reply)
+        send_message(reply, chat_id)
+
     except Exception as e:
-        log.error(f"Error: {e}")
-        bot.reply_to(message, f"Something went wrong. Error: {str(e)}")
+        log.error(f"Claude error: {e}")
+        send_message(f"Something went wrong: {str(e)}", chat_id)
 
-# ── NEWS FUNCTIONS ─────────────────────────────────────────────
-
-def load_hold_queue():
-    if os.path.exists(HOLD_QUEUE_FILE):
-        with open(HOLD_QUEUE_FILE) as f:
-            return json.load(f)
-    return []
-
-def save_hold_queue(queue):
-    with open(HOLD_QUEUE_FILE, "w") as f:
-        json.dump(queue, f)
-
-def load_sent_ids():
-    if os.path.exists(SENT_IDS_FILE):
-        with open(SENT_IDS_FILE) as f:
-            return set(json.load(f))
-    return set()
-
-def save_sent_ids(ids):
-    with open(SENT_IDS_FILE, "w") as f:
-        json.dump(list(ids)[-500:], f)
-
-def purge_stale_held(queue):
-    cutoff = datetime.now(IST) - timedelta(hours=36)
-    return [s for s in queue if datetime.fromisoformat(s["held_at"]) > cutoff]
-
-def send_telegram(text, chat_id=None):
-    if not text or not text.strip():
-        return
-    target = chat_id or TELEGRAM_CHAT_ID
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        requests.post(url, json={"chat_id": target, "text": chunk, "parse_mode": "HTML"})
-        time.sleep(0.5)
+# ─────────────────────────────────────────────
+# NEWS — FETCH
+# ─────────────────────────────────────────────
 
 SEARCH_QUERIES = {
-    "GLOBAL":            ["geopolitics war sanctions", "US economy inflation Federal Reserve", "oil price crude gold commodities"],
-    "INDIA":             ["India economy RBI policy rupee", "India government policy regulation", "India trade export import tariff"],
-    "RETAIL_APPAREL":    ["India fashion retail apparel textile", "India GST garments textile policy"],
-    "LABOUR_COMPLIANCE": ["India labour code EPFO ESIC", "India employment law court ruling gratuity"],
-    "HR_WORKFORCE":      ["India hiring layoffs workforce", "India unemployment wage workforce data"],
-    "HR_TECH":           ["HR technology AI hiring payroll HRMS India", "Darwinbox greytHR Keka HR tech India"],
-    "MARKET":            ["Nifty Sensex stock market India", "FII DII India stock market flows"],
+    "GLOBAL": [
+        "geopolitics war sanctions oil",
+        "US economy Federal Reserve inflation",
+        "China economy trade policy",
+    ],
+    "INDIA": [
+        "India economy RBI policy rupee",
+        "India government regulation policy",
+        "India trade export import tariff",
+    ],
+    "RETAIL_APPAREL": [
+        "India fashion retail apparel textile",
+        "India GST garments textile policy",
+    ],
+    "LABOUR_COMPLIANCE": [
+        "India labour code EPFO ESIC minimum wage",
+        "India employment law gratuity court ruling",
+    ],
+    "HR_WORKFORCE": [
+        "India hiring layoffs workforce trends",
+    ],
+    "HR_TECH": [
+        "HR technology AI payroll HRMS India",
+        "Darwinbox greytHR Keka HR tech",
+    ],
+    "MARKET": [
+        "Nifty Sensex India stock market",
+        "FII DII India market flows",
+    ],
 }
 
 SECTION_LABELS = {
@@ -138,18 +216,42 @@ SECTION_LABELS = {
     "MARKET":            "📈 MARKET WATCH",
 }
 
+SECTION_CAPS = {
+    "GLOBAL": 8, "INDIA": 8,
+    "RETAIL_APPAREL": 3, "LABOUR_COMPLIANCE": 3,
+    "HR_WORKFORCE": 3, "HR_TECH": 3, "MARKET": 3,
+}
+
+def load_json(filepath, default):
+    if os.path.exists(filepath):
+        with open(filepath) as f:
+            return json.load(f)
+    return default
+
+def save_json(filepath, data):
+    with open(filepath, "w") as f:
+        json.dump(data, f)
+
 def fetch_all_news():
-    sent_ids = load_sent_ids()
+    sent_ids = set(load_json(SENT_IDS_FILE, []))
     all_articles = {}
+
     for section, queries in SEARCH_QUERIES.items():
         articles = []
         for q in queries:
             try:
-                resp = requests.get("https://newsapi.org/v2/everything", params={
-                    "q": q, "language": "en", "sortBy": "publishedAt",
-                    "pageSize": 10, "apiKey": NEWS_API_KEY,
-                    "from": (datetime.now(IST) - timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%S"),
-                }, timeout=10)
+                resp = requests.get(
+                    "https://newsapi.org/v2/everything",
+                    params={
+                        "q": q,
+                        "language": "en",
+                        "sortBy": "publishedAt",
+                        "pageSize": 10,
+                        "apiKey": NEWS_API_KEY,
+                        "from": (datetime.now(IST) - timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%S"),
+                    },
+                    timeout=10
+                )
                 if resp.ok:
                     for a in resp.json().get("articles", []):
                         uid = a.get("url", "")
@@ -157,92 +259,198 @@ def fetch_all_news():
                             articles.append(a)
                             sent_ids.add(uid)
             except Exception as e:
-                log.error(f"News fetch error: {e}")
+                log.error(f"News fetch error [{q}]: {e}")
             time.sleep(0.3)
         all_articles[section] = articles
-    save_sent_ids(sent_ids)
+
+    save_json(SENT_IDS_FILE, list(sent_ids)[-500:])
     return all_articles
 
-CLASSIFY_SYSTEM = """
-You are a strict news classifier for a senior HR professional in India.
-For each article classify as URGENT | IMPORTANT | DISCARD and write a ONE-LINE bullet (max 15 words). Fact first. No source name.
-Output ONLY valid JSON. No markdown. Format:
-{"GLOBAL":[{"headline":"...","class":"URGENT|IMPORTANT|DISCARD"}],"INDIA":[...],"RETAIL_APPAREL":[...],"LABOUR_COMPLIANCE":[...],"HR_WORKFORCE":[...],"HR_TECH":[...],"MARKET":[...]}
-"""
+# ─────────────────────────────────────────────
+# NEWS — CLASSIFY VIA CLAUDE
+# ─────────────────────────────────────────────
+
+CLASSIFY_PROMPT = """You are a news classifier for Ritika Gawri, Head of HR at an Indian apparel company.
+
+For each article, classify as:
+- URGENT: Breaking, market-moving, or requires immediate attention
+- IMPORTANT: Relevant and useful, but not time-critical
+- DISCARD: Irrelevant, opinion, celebrity, sports, repetitive
+
+For URGENT and IMPORTANT, write a single bullet line — max 15 words, fact-first, no source name.
+
+Output ONLY valid JSON, no markdown:
+{"GLOBAL":[{"headline":"...","class":"URGENT|IMPORTANT|DISCARD"}],"INDIA":[...],"RETAIL_APPAREL":[...],"LABOUR_COMPLIANCE":[...],"HR_WORKFORCE":[...],"HR_TECH":[...],"MARKET":[...]}"""
 
 def classify_news(all_articles):
-    input_data = {s: [{"title": a.get("title",""), "description": a.get("description","")} for a in arts] for s, arts in all_articles.items()}
+    input_data = {
+        section: [
+            {"title": a.get("title", ""), "description": a.get("description", "")}
+            for a in articles
+        ]
+        for section, articles in all_articles.items()
+    }
+
     try:
-        resp = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 4000, "system": CLASSIFY_SYSTEM,
-                  "messages": [{"role": "user", "content": json.dumps(input_data)}]},
-            timeout=30)
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 4000,
+                "system": CLASSIFY_PROMPT,
+                "messages": [{"role": "user", "content": json.dumps(input_data)}]
+            },
+            timeout=40
+        )
         if resp.ok:
-            text = resp.json()["content"][0]["text"].strip().lstrip("```json").rstrip("```").strip()
+            text = resp.json()["content"][0]["text"].strip()
+            text = text.replace("```json", "").replace("```", "").strip()
             return json.loads(text)
     except Exception as e:
-        log.error(f"Claude classify error: {e}")
+        log.error(f"News classification error: {e}")
     return {}
 
+# ─────────────────────────────────────────────
+# NEWS — BRIEF BUILDER
+# ─────────────────────────────────────────────
+
+def purge_stale(queue):
+    cutoff = datetime.now(IST) - timedelta(hours=36)
+    return [s for s in queue if datetime.fromisoformat(s["held_at"]) > cutoff]
+
 def morning_brief_job(triggered=False, chat_id=None):
-    log.info("Running news brief...")
+    target = chat_id or TELEGRAM_CHAT_ID
+    log.info(f"Running {'on-demand' if triggered else 'scheduled'} news brief...")
+
     all_articles = fetch_all_news()
-    classified   = classify_news(all_articles)
-    hold_queue   = load_hold_queue()
+    if not any(all_articles.values()):
+        send_message("No new articles found at this time.", target)
+        return
 
-    now_str = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
-    lines = [f"<b>📰 {'On-Demand Brief' if triggered else 'Morning Brief'} — {now_str}</b>\n"]
+    classified = classify_news(all_articles)
+    if not classified:
+        send_message("News fetched but classification failed. Try again shortly.", target)
+        return
 
-    new_held = []
-    for section, label in SECTION_LABELS.items():
+    hold_queue = purge_stale(load_json(HOLD_QUEUE_FILE, []))
+    now_str    = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
+    label      = "On-Demand Brief" if triggered else "Morning Brief"
+    lines      = [f"<b>📰 {label} — {now_str} IST</b>\n"]
+    new_held   = []
+
+    for section, sec_label in SECTION_LABELS.items():
         items   = classified.get(section, [])
         bullets = [i["headline"] for i in items if i.get("class") in ("URGENT", "IMPORTANT")]
-        cap     = 10 if section in ("GLOBAL", "INDIA") else 3
+        cap     = SECTION_CAPS.get(section, 3)
+
         if bullets:
-            lines.append(f"\n<b>{label}</b>")
+            lines.append(f"\n<b>{sec_label}</b>")
             for b in bullets[:cap]:
                 lines.append(f"• {b}")
+
         for i in items:
             if i.get("class") == "IMPORTANT":
-                new_held.append({"headline": i["headline"], "section": section, "held_at": datetime.now(IST).isoformat()})
+                new_held.append({
+                    "headline": i["headline"],
+                    "section": section,
+                    "held_at": datetime.now(IST).isoformat()
+                })
 
-    hold_queue = purge_stale_held(hold_queue)
     if hold_queue and not triggered:
         lines.append("\n<b>📌 HELD FROM YESTERDAY</b>")
         for item in hold_queue:
             lines.append(f"• {item['headline']}")
 
-    send_telegram("\n".join(lines), chat_id=chat_id)
-    save_hold_queue(purge_stale_held(new_held))
+    if len(lines) <= 1:
+        lines.append("Nothing significant to report right now.")
+
+    send_message("\n".join(lines), target)
+    save_json(HOLD_QUEUE_FILE, purge_stale(new_held))
     log.info("Brief sent.")
 
+# ─────────────────────────────────────────────
+# NEWS — URGENT ALERTS
+# ─────────────────────────────────────────────
+
+URGENT_PROMPT = """Detect ONLY truly urgent news for an Indian HR and finance professional.
+Hard thresholds: Nifty/Sensex >1.5% intraday move, RBI unscheduled action, war escalation, 
+Brent crude >3% move, Supreme Court labour ruling, EPFO/ESIC rate change, 
+US Fed surprise, major country default, India textile/GST change.
+
+For each qualifying story output:
+Category: [one word]
+Line1: [what happened, max 15 words]
+Line2: [why it matters for India/markets/HR, max 15 words]
+
+If nothing qualifies output exactly: NONE"""
+
 def check_urgent_alerts():
+    log.info("Checking urgent alerts...")
     all_articles = fetch_all_news()
     flat = [a for arts in all_articles.values() for a in arts]
     if not flat:
         return
-    input_text = "\n".join([f"- {a.get('title','')} | {a.get('description','')}" for a in flat])
+
+    input_text = "\n".join([
+        f"- {a.get('title', '')} | {a.get('description', '')}"
+        for a in flat
+    ])
+
     try:
-        resp = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000,
-                  "system": "Detect only truly urgent market/HR/labour news crossing hard thresholds. Output Category, Line1, Line2 or exactly NONE.",
-                  "messages": [{"role": "user", "content": input_text}]},
-            timeout=20)
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "system": URGENT_PROMPT,
+                "messages": [{"role": "user", "content": input_text}]
+            },
+            timeout=20
+        )
         if resp.ok:
             result = resp.json()["content"][0]["text"].strip()
             if result and result != "NONE":
-                send_telegram(f"⚡ <b>URGENT ALERT</b>\n{result}")
+                category = result.split("Category:")[-1].split("Line1:")[0].strip()
+                lines = [f"⚡ <b>URGENT — {category}</b>"]
+                for line in result.split("\n"):
+                    if line.startswith("Line1:") or line.startswith("Line2:"):
+                        lines.append(f"• {line.split(':', 1)[-1].strip()}")
+                send_broadcast("\n".join(lines))
+                log.info("Urgent alert sent.")
+            else:
+                log.info("No urgent news.")
     except Exception as e:
-        log.error(f"Urgent check error: {e}")
+        log.error(f"Urgent alert error: {e}")
 
-# ── MAIN ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone=IST)
+
+    # Morning brief — 7 AM IST daily
     scheduler.add_job(morning_brief_job, "cron", hour=7, minute=0)
-    scheduler.add_job(check_urgent_alerts, "cron", hour="9,10,11,12,13,14,15", minute=30, day_of_week="mon-fri")
+
+    # Urgent alerts — every 90 min during market hours, Mon-Fri
+    scheduler.add_job(check_urgent_alerts, "cron",
+                      hour="9,10,11,12,13,14,15", minute=30,
+                      day_of_week="mon-fri")
+    scheduler.add_job(check_urgent_alerts, "cron",
+                      hour=9, minute=0, day_of_week="mon-fri")
+    scheduler.add_job(check_urgent_alerts, "cron",
+                      hour=15, minute=55, day_of_week="mon-fri")
+
     scheduler.start()
-    log.info("ARIA + News Agent starting...")
+    log.info("ARIA is online.")
     bot.infinity_polling()
