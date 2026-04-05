@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST           = ZoneInfo("Asia/Kolkata")
 SENT_IDS_FILE = "sent_ids.json"
 
-bot    = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
+bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # ─────────────────────────────────────────────
@@ -274,7 +274,7 @@ def fetch_all_rss():
             time.sleep(0.3)
 
         all_articles[section] = articles
-        log.info(f"{section}: {len(articles)} fresh articles fetched")
+        log.info(f"{section}: {len(articles)} fresh articles")
 
     save_json(SENT_IDS_FILE, list(sent_ids)[-1000:])
     return all_articles
@@ -285,7 +285,7 @@ def fetch_all_rss():
 
 CLASSIFY_PROMPT = """You are a news classifier for Ritika Gawri, Head of HR at Numero Uno Clothing Limited (NUCL), an Indian apparel manufacturer and retailer with factories in Haryana and Uttarakhand and retail stores pan-India.
 
-You will receive real news articles fetched live from RSS feeds right now.
+You will receive real news articles fetched live from RSS feeds.
 
 For each article classify as URGENT, IMPORTANT, or DISCARD.
 For URGENT and IMPORTANT write one bullet — max 15 words, fact-first, no source name, no asterisks, no markdown.
@@ -338,9 +338,9 @@ def classify_articles(all_articles):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key":          ANTHROPIC_KEY,
-                "anthropic-version":  "2023-06-01",
-                "content-type":       "application/json"
+                "x-api-key":         ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json"
             },
             json={
                 "model":      "claude-sonnet-4-20250514",
@@ -484,61 +484,67 @@ def check_urgent_alerts():
         log.error(f"Urgent alert error: {e}")
 
 # ─────────────────────────────────────────────
-# BOT HANDLERS
+# SINGLE MESSAGE HANDLER — handles ALL messages
 # ─────────────────────────────────────────────
 
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    log.info(f"Received /start from {message.chat.id}")
-    send_message(
-        "Hi Ritika! ARIA is online.\n\n"
-        "<b>Commands:</b>\n"
-        "/news — fetch live news brief\n"
-        "/clear — clear conversation history\n"
-        "/help — show this menu\n\n"
-        "Or just type anything — I am here.",
-        message.chat.id
-    )
+@bot.message_handler(func=lambda m: m.text is not None)
+def handle_all(message):
+    text    = message.text.strip()
+    chat_id = message.chat.id
 
-@bot.message_handler(commands=["help"])
-def cmd_help(message):
-    log.info(f"Received /help from {message.chat.id}")
-    send_message(
-        "<b>ARIA — Your Personal AI Assistant</b>\n\n"
-        "/news — Live news brief with NUCL impact\n"
-        "/clear — Fresh conversation start\n\n"
-        "<b>I handle:</b>\n"
-        "• HR and labour compliance (NUCL)\n"
-        "• Live news briefs at 7 AM IST daily\n"
-        "• NUCL impact analysis in every brief\n"
-        "• Financial and retirement planning\n"
-        "• Any research or drafting you need",
-        message.chat.id
-    )
+    log.info(f"Received from {chat_id}: {text[:60]}")
 
-@bot.message_handler(commands=["clear"])
-def cmd_clear(message):
-    log.info(f"Received /clear from {message.chat.id}")
-    conversation_history[message.chat.id] = []
-    send_message("Conversation cleared. Fresh start!", message.chat.id)
+    # /news
+    if text.startswith("/news"):
+        send_message("Fetching live news from RSS feeds... give me a moment.", chat_id)
+        threading.Thread(
+            target=build_and_send_brief,
+            kwargs={"chat_id": chat_id, "triggered": True},
+            daemon=True
+        ).start()
+        return
 
-@bot.message_handler(commands=["news"])
-def cmd_news(message):
-    log.info(f"Received /news from {message.chat.id}")
-    send_message("Fetching live news from RSS feeds... give me a moment.", message.chat.id)
-    threading.Thread(
-        target=build_and_send_brief,
-        kwargs={"chat_id": message.chat.id, "triggered": True},
-        daemon=True
-    ).start()
+    # /clear
+    if text.startswith("/clear"):
+        conversation_history[chat_id] = []
+        send_message("Conversation cleared. Fresh start!", chat_id)
+        return
 
-@bot.message_handler(func=lambda m: m.text is not None and not m.text.startswith("/"))
-def handle_message(message):
-    log.info(f"Received message from {message.chat.id}: {message.text[:50]}")
-    chat_id   = message.chat.id
-    user_text = message.text
+    # /start
+    if text.startswith("/start"):
+        send_message(
+            "Hi Ritika! ARIA is online.\n\n"
+            "<b>Commands:</b>\n"
+            "/news — fetch live news brief\n"
+            "/clear — clear conversation history\n"
+            "/help — show this menu\n\n"
+            "Or just type anything — I am here.",
+            chat_id
+        )
+        return
 
-    add_to_history(chat_id, "user", user_text)
+    # /help
+    if text.startswith("/help"):
+        send_message(
+            "<b>ARIA — Your Personal AI Assistant</b>\n\n"
+            "/news — Live news brief with NUCL impact\n"
+            "/clear — Fresh conversation start\n\n"
+            "<b>I handle:</b>\n"
+            "• HR and labour compliance (NUCL)\n"
+            "• Live news briefs at 7 AM IST daily\n"
+            "• NUCL impact analysis in every brief\n"
+            "• Financial and retirement planning\n"
+            "• Any research or drafting you need",
+            chat_id
+        )
+        return
+
+    # ignore other commands
+    if text.startswith("/"):
+        return
+
+    # regular message — send to Claude
+    add_to_history(chat_id, "user", text)
 
     try:
         response = client.messages.create(
@@ -574,4 +580,4 @@ if __name__ == "__main__":
 
     scheduler.start()
     log.info("ARIA is online. Morning brief 7 AM IST. Urgent checks 9 AM-4 PM IST.")
-    bot.infinity_polling(allowed_updates=["message"])
+    bot.infinity_polling()
